@@ -1,0 +1,36 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: hmdp
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://39.107.238.93:3306/dianping?useSSL=false&serverTimezone=UTC&characterEncoding=utf8
+    username: n1425362023
+    password: 12345678
+  data:
+    redis:
+      host: 39.107.238.93
+      port: 6379
+      password: 12345678
+      lettuce:
+        pool:
+          max-active: 10
+          max-idle: 10
+          min-idle: 1
+          max-wait: 2000ms # 添加最大等待时间
+          time-between-eviction-runs: 10s
+  jackson:
+    default-property-inclusion: non_null
+  main:
+    allow-bean-definition-overriding: true # 允许Bean覆盖
+
+mybatis-plus:
+  type-aliases-package: com.hmdp.entity
+  configuration:
+    map-underscore-to-camel-case: true # 建议开启驼峰映射
+
+logging:
+  level:
+    com.hmdp: debug
+    org.springframework: warn # 降低框架日志级别
