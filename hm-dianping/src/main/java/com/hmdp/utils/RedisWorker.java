@@ -24,8 +24,11 @@ public class RedisWorker {
 
         //2. 生成序列号
         String date = now.format(DateTimeFormatter.ofPattern("yyyy:MM:dd"));
-        long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + date);
-
+        Long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + date);
+        if (count == null) {
+            // 处理null情况，比如设置默认值或抛出业务异常
+            count = 0L;
+        }
         return timestamp <<COUNT_BITS | count;
 
     }

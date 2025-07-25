@@ -24,7 +24,12 @@ spring:
     default-property-inclusion: non_null
   main:
     allow-bean-definition-overriding: true # 允许Bean覆盖
-
+  rabbitmq:
+      host: 39.107.238.93 # 你的虚拟机IP
+      port: 5672 # 端口
+      virtual-host: /dianping # 虚拟主机
+      username: admin # 用户名
+      password: 12345678 # 密码
 mybatis-plus:
   type-aliases-package: com.hmdp.entity
   configuration:

@@ -1,20 +1,31 @@
 package com.hmdp.service.impl;
 
+import com.alibaba.fastjson.JSON;
+import com.google.common.util.concurrent.RateLimiter;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
+import com.hmdp.redismq.MQSender;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisWorker;
 import com.hmdp.utils.UserHolder;
-import lombok.AllArgsConstructor;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
 
-import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.Objects;
+import java.util.concurrent.*;
 
 /**
  * <p>
@@ -25,54 +36,84 @@ import java.time.LocalDateTime;
  * @since 2021-12-22
  */
 @Service
-@AllArgsConstructor
+@Slf4j
+@RequiredArgsConstructor
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
-    private TransactionTemplate transactionTemplate;
-    private ISeckillVoucherService seckillVoucherService;
-    private RedisWorker redisWorker;
-    @Override
+    private final StringRedisTemplate stringRedisTemplate;
+    private final RateLimiter rateLimiter = RateLimiter.create(10);
+    private final ISeckillVoucherService seckillVoucherService;
+    private final MQSender mqSender;
+    private final RedissonClient redissonClient;
+    private final RedisWorker redisWorker;
+    private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    static {
+        SECKILL_SCRIPT = new DefaultRedisScript<>();
+        SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
+        SECKILL_SCRIPT.setResultType(Long.class);
+    }
+    private final BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024*1024);
+    private final ExecutorService SECKILL_ORDER_EXECUTOR=Executors.newSingleThreadExecutor();
+    @PostConstruct
+    private void init() {
+        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+    }
+    private class VoucherOrderHandler implements Runnable{
+        @Override
+        public void run() {
+            while (true) {
+                try{
+                    VoucherOrder voucherOrder = orderTasks.take();
+                    handleVoucherOrder(voucherOrder);
+                }catch (Exception e){
+                    log.error("处理订单异常",e);
+                }
+            }
+        }
+    }
+    @SneakyThrows
+    private void handleVoucherOrder(VoucherOrder voucherOrder) {
+        Long userId = voucherOrder.getUserId();
+        RLock lock = redissonClient.getLock("lock:order:" + userId);
+        boolean islock = lock.tryLock(1,5, TimeUnit.SECONDS);
+        if(!islock){
+            log.error("不允许重复下单");
+        }
+
+        try {
+            // 更新秒杀券库存
+            boolean success = seckillVoucherService.lambdaUpdate().
+                    setSql("stock = stock - 1").set(SeckillVoucher::getVoucherId, voucherOrder.getVoucherId())
+                    .gt(SeckillVoucher::getStock, 0).update();
+            if (!success) {
+                log.error("库存不足");
+                return;
+            }
+            save(voucherOrder);
+        } finally {
+            lock.unlock();
+        }
+    }
 
     public Result seckillVoucher(Long voucherId) {
-        // 根据voucherId获取秒杀券信息
-        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
-        // 判断秒杀活动是否已经开始
-        if(voucher.getBeginTime().isAfter(LocalDateTime.now())){
-            return Result.fail("秒杀活动尚未开始");
+        //令牌桶算法 限流
+        if (!rateLimiter.tryAcquire(1000, TimeUnit.MILLISECONDS)){
+            return Result.fail("目前网络正忙，请重试");
         }
-        // 判断秒杀活动是否已经结束
-        if(voucher.getEndTime().isBefore(LocalDateTime.now())){
-            return Result.fail("秒杀活动已经结束");
+        Long userId = UserHolder.getUser().getId();
+        Long orderId = redisWorker.nextId("order");
+        Long execute =  stringRedisTemplate.execute(
+                SECKILL_SCRIPT,
+                Collections.emptyList(),
+                voucherId.toString(),userId.toString());
+        if (Objects.requireNonNull(execute).intValue() != 0) {
+            return Result.fail(execute == 1 ? "库存不足" : "不能重复下单");
         }
-        // 判断库存是否足够
-        if(voucher.getStock() < 1){
-            return Result.fail("库存不足");
-        }
-        // 使用用户id作为锁的key，保证同一用户不能重复抢购
-        synchronized (UserHolder.getUser().getId().toString().intern()){
-            return transactionTemplate.execute(status -> {
-
-                // 查询该用户是否已经抢购过该秒杀券
-                long count = lambdaQuery().eq(VoucherOrder::getUserId, UserHolder.getUser().getId()).count();
-                if (count > 0) {
-                    return Result.fail("不能重复抢购");
-                }
-
-                // 更新秒杀券库存
-                boolean success = seckillVoucherService.lambdaUpdate().
-                        setSql("stock = stock - 1").set(SeckillVoucher::getVoucherId, voucherId)
-                        .gt(SeckillVoucher::getStock, 0).update();
-                if (!success) {
-                    return Result.ok("秒杀失败");
-                }
-
-                // 创建订单
-                VoucherOrder voucherOrder = new VoucherOrder();
-                voucherOrder.setId(redisWorker.nextId("order"))
-                        .setUserId(UserHolder.getUser().getId())
-                        .setVoucherId(voucherId);
-                save(voucherOrder);
-                return Result.ok("秒杀成功");
-            });
-        }
+        VoucherOrder voucherOrder = new VoucherOrder();
+        voucherOrder.setId(orderId)
+                .setUserId(userId)
+                .setVoucherId(voucherId);
+        mqSender.sendSeckillMessage(JSON.toJSONString(voucherOrder));
+        //orderTasks.add(voucherOrder);
+        return Result.ok(orderId);
     }
 }
